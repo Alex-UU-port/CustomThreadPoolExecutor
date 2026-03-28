@@ -1,35 +1,40 @@
 package alexuuport;
 
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 
 public class Main {
-    public static void main(String[] args) {
 
-            CustomThreadPoolExecutor ex = new CustomThreadPoolExecutor(2,
-                    4,
-                    10,
-                    2,
-                    5 ,
-                    TimeUnit.SECONDS);
+    public static void main(String[] args) throws Exception {
 
-        for (int i = 0; i < 10; i++) {
+        CustomThreadPoolExecutor pool =
+                new CustomThreadPoolExecutor(
+                        2,      // core
+                        4,      // max
+                        5,      // queue per worker
+                        5,      // keepAlive
+                        TimeUnit.SECONDS
+                );
+
+        // Отправляем 15 задач (специально больше чем пул выдержит)
+        for (int i = 1; i <= 15; i++) {
+
             int taskId = i;
 
-            ex.execute(() -> {
-                System.out.println(Thread.currentThread().getName() +
-                        " START task " + taskId);
+            pool.execute(() -> {
+                PoolLogger.log("Задача",
+                        "Задача " + taskId + " началась.");
 
                 try {
-                    Thread.sleep(1000);
-                } catch (InterruptedException e) {
-                    System.out.println("Interrupted " + taskId);
-                }
+                    Thread.sleep(2000);
+                } catch (InterruptedException ignored) {}
 
-                System.out.println(Thread.currentThread().getName() +
-                        " END task " + taskId);
+                PoolLogger.log("Задача",
+                        "Задача " + taskId + " завершилась.");
             });
         }
 
-        ex.shutdown();
+        Thread.sleep(15000);
+
+        pool.shutdown();
     }
 }

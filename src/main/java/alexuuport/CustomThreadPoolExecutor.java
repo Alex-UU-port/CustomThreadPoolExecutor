@@ -1,120 +1,154 @@
 package alexuuport;
 
-import java.util.Set;
+import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
- * Кастомная реализация пула потоков.
- * Поддерживает:
- *  - execute(Runnable)
- *  - submit(Callable)
- *  - ограниченную очередь
- *  - keepAliveTime
- *  - minSpareThreads (кастомная логика)
+ * Кастомный пул потоков.
+ *
+ * Реализовано:
+ *  - Round Robin распределение задач
+ *  - Отдельная очередь на каждый Worker
+ *  - Idle timeout (keepAliveTime)
+ *  - CallerRunsPolicy (механизм back-pressure)
+ *  - Потокобезопасная коллекция workers
+ *  - Подробное логирование на русском языке
  */
 public class CustomThreadPoolExecutor implements CustomExecutor {
 
-    // --- Конфигурация пула ---
+    // ====== Конфигурация пула ======
 
-    // минимальное количество потоков (ядро)
-    private final int corePoolSize;
-
-    // максимальное количество потоков
-    private final int maxPoolSize;
-
-    // минимальное количество свободных потоков (кастомная фича)
-    private final int minSpareThreads;
-
-    // время жизни неактивного потока
-    private final long keepAliveTime;
-
-    // единицы измерения времени
+    private final int corePoolSize;   // минимальное количество потоков
+    private final int maxPoolSize;    // максимальное количество потоков
+    private final int queueSize;      // размер очереди на одного worker
+    private final long keepAliveTime; // время простоя перед завершением
     private final TimeUnit timeUnit;
 
-    // очередь задач (ограниченная)
-    private final BlockingQueue<Runnable> taskQueue;
+    // ====== Состояние пула ======
 
-    // множество всех воркеров (нужно для управления и shutdown)
-    private final Set<Worker> workers = ConcurrentHashMap.newKeySet();
+    // Потокобезопасный список рабочих потоков
+    private final List<Worker> workers = new CopyOnWriteArrayList<>();
 
-    // общее количество потоков
-    private final AtomicInteger totalThreads = new AtomicInteger(0);
+    // Счётчик для Round Robin распределения
+    private final AtomicInteger roundRobinIndex = new AtomicInteger(0);
 
-    // количество простаивающих потоков
-    private final AtomicInteger idleThreads = new AtomicInteger(0);
-
-    // флаг остановки пула
+    // Флаг завершения пула
     private volatile boolean isShutdown = false;
 
-    public CustomThreadPoolExecutor(
-            int corePoolSize,
-            int maxPoolSize,
-            int queueSize,
-            int minSpareThreads,
-            long keepAliveTime,
-            TimeUnit timeUnit
-    ) {
+    // Фабрика потоков
+    private final CustomThreadFactory threadFactory;
+
+    // Политика отказа
+    private final RejectionHandler rejectionHandler;
+
+    public CustomThreadPoolExecutor(int corePoolSize,
+                                    int maxPoolSize,
+                                    int queueSize,
+                                    long keepAliveTime,
+                                    TimeUnit timeUnit) {
+
         this.corePoolSize = corePoolSize;
         this.maxPoolSize = maxPoolSize;
-        this.minSpareThreads = minSpareThreads;
+        this.queueSize = queueSize;
         this.keepAliveTime = keepAliveTime;
         this.timeUnit = timeUnit;
 
-        // ограниченная потокобезопасная очередь
-        this.taskQueue = new ArrayBlockingQueue<>(queueSize);
+        this.threadFactory = new CustomThreadFactory("МойПул");
 
-        // создаём core-потоки сразу
+        // Выбрана стратегия CallerRunsPolicy:
+        // - задачи не теряются
+        // - создаётся естественное ограничение нагрузки
+        this.rejectionHandler = new CallerRunsPolicy();
+
+        // Создаём базовые (core) потоки сразу
         for (int i = 0; i < corePoolSize; i++) {
             addWorker();
         }
     }
 
     /**
-     * Основной метод для запуска Runnable задач
+     * Создание нового рабочего потока.
+     */
+    private void addWorker() {
+
+        if (workers.size() >= maxPoolSize) {
+            return;
+        }
+
+        BlockingQueue<Runnable> queue =
+                new ArrayBlockingQueue<>(queueSize);
+
+        Worker worker = new Worker(queue);
+
+        Thread thread = threadFactory.newThread(worker);
+        worker.thread = thread;
+
+        workers.add(worker);
+
+        thread.start();
+    }
+
+    /**
+     * Отправка задачи в пул.
+     * Используется алгоритм Round Robin.
      */
     @Override
     public void execute(Runnable command) {
 
-        // если пул остановлен — новые задачи не принимаем
+        if (command == null)
+            throw new NullPointerException("Задача не может быть null");
+
         if (isShutdown) {
-            throw new RejectedExecutionException("Executor is shutdown");
+            rejectionHandler.reject(command, this);
+            return;
         }
 
+        int size = workers.size();
 
-        log("Submitting task");
-        // пробуем положить задачу в очередь
-        if (!taskQueue.offer(command)) {
+        if (size == 0) {
+            rejectionHandler.reject(command, this);
+            return;
+        }
 
-            log("Очередь заполнена, попытка создать worker");
-            // если очередь заполнена — пробуем создать новый поток
-            if (totalThreads.get() < maxPoolSize) {
+        int index = Math.abs(
+                roundRobinIndex.getAndIncrement() % size
+        );
+
+        Worker worker = workers.get(index);
+
+        if (!worker.queue.offer(command)) {
+
+            PoolLogger.log("Пул",
+                    "Очередь #" + index + " переполнена.");
+
+            if (workers.size() < maxPoolSize) {
+
+                PoolLogger.log("Пул",
+                        "Создаём дополнительный поток из-за высокой нагрузки.");
+
                 addWorker();
-
-                // повторная попытка добавить задачу
-                if (!taskQueue.offer(command)) {
-                    throw new RejectedExecutionException("Queue is full");
-                }
-            } else {
-                // если достигли maxPoolSize — отклоняем задачу
-                throw new RejectedExecutionException("Max threads reached");
+                execute(command);
+                return;
             }
-        }
 
-        // после добавления задачи проверяем minSpareThreads
-        adjustSpareThreads();
+            rejectionHandler.reject(command, this);
+
+        } else {
+            PoolLogger.log("Пул",
+                    "Задача принята в очередь #" + index);
+        }
     }
 
     /**
-     * submit оборачивает Callable в FutureTask
+     * Поддержка Callable через FutureTask.
      */
     @Override
     public <T> Future<T> submit(Callable<T> callable) {
 
-        // FutureTask реализует и Runnable, и Future
         FutureTask<T> futureTask = new FutureTask<>(callable);
 
-        // отправляем как обычную задачу
         execute(futureTask);
 
         return futureTask;
@@ -122,136 +156,98 @@ public class CustomThreadPoolExecutor implements CustomExecutor {
 
     /**
      * Мягкая остановка:
-     * - новые задачи не принимаем
-     * - текущие продолжают выполняться
+     * - новые задачи не принимаются
+     * - текущие завершаются
      */
     @Override
     public void shutdown() {
+        PoolLogger.log("Пул", "Инициирована корректная остановка пула.");
         isShutdown = true;
-        log("Shutdown initiated");
     }
 
     /**
      * Жёсткая остановка:
      * - прерываем все потоки
-     * - очищаем очередь
      */
     @Override
     public void shutdownNow() {
+
+        PoolLogger.log("Пул", "Инициирована немедленная остановка пула.");
+
         isShutdown = true;
 
-        // прерываем все воркеры
         for (Worker worker : workers) {
-            worker.interrupt();
-        }
-        log("Shutdown NOW initiated");
-        // удаляем все ожидающие задачи
-        taskQueue.clear();
-    }
-
-    /**
-     * Добавляет новый поток в пул
-     */
-    private void addWorker() {
-
-        // защита от превышения лимита
-        if (totalThreads.get() >= maxPoolSize) return;
-
-        log("Creating new worker");
-        Worker worker = new Worker();
-
-        workers.add(worker);
-
-        // увеличиваем счётчики
-        totalThreads.incrementAndGet();
-        idleThreads.incrementAndGet();
-
-        worker.start();
-    }
-
-    /**
-     * Обеспечивает наличие минимального количества свободных потоков
-     */
-    private void adjustSpareThreads() {
-
-        // если свободных потоков меньше, чем нужно —
-        // создаём новые (даже без высокой нагрузки)
-        while (idleThreads.get() < minSpareThreads
-                && totalThreads.get() < maxPoolSize) {
-
-            addWorker();
+            worker.thread.interrupt();
         }
     }
 
-    /**
-     * Получение задачи для выполнения
-     */
-    private Runnable getTask() {
+    public boolean isShutdown() {
+        return isShutdown;
+    }
 
-        try {
-            // если поток "сверх core" — он может умереть по таймауту
-            if (totalThreads.get() > corePoolSize) {
-                return taskQueue.poll(keepAliveTime, timeUnit);
-            } else {
-                log("Waiting for task...");
-                // core-потоки живут всегда и ждут задачу
-                return taskQueue.take();
-            }
-        } catch (InterruptedException e) {
-            // если поток прервали — завершаем его
-            return null;
+    /**
+     * Рабочий поток.
+     *
+     * - Обрабатывает задачи из своей очереди.
+     * - Завершается по таймауту простоя.
+     */
+    private class Worker implements Runnable {
+
+        private final BlockingQueue<Runnable> queue;
+        private Thread thread;
+
+        Worker(BlockingQueue<Runnable> queue) {
+            this.queue = queue;
         }
-    }
-
-    private void log(String message) {
-        System.out.printf(
-                "[%s] [threads=%d idle=%d queue=%d] %s%n",
-                Thread.currentThread().getName(),
-                totalThreads.get(),
-                idleThreads.get(),
-                taskQueue.size(),
-                message
-        );
-    }
-
-    /**
-     * Внутренний класс рабочего потока
-     */
-    private class Worker extends Thread {
 
         @Override
         public void run() {
+
             try {
+
                 while (true) {
 
-
-                    log("Worker started");
-                    // берём задачу
-                    Runnable task = getTask();
-
-                    // если null — поток должен завершиться
-                    if (task == null) {
-                        log("Worker exiting (no task / timeout / interrupt)");
-                        return;
+                    // Если пул завершён и задач нет — выходим
+                    if (isShutdown && queue.isEmpty()) {
+                        break;
                     }
 
-                    // поток перестаёт быть idle
-                    idleThreads.decrementAndGet();
+                    Runnable task =
+                            queue.poll(keepAliveTime, timeUnit);
+
+                    // Если задача не поступила за keepAliveTime
+                    if (task == null) {
+
+                        if (workers.size() > corePoolSize) {
+
+                            PoolLogger.log("Рабочий поток",
+                                    Thread.currentThread().getName()
+                                            + " завершает работу по таймауту простоя.");
+
+                            workers.remove(this);
+                            break;
+                        }
+
+                        continue;
+                    }
+
+                    PoolLogger.log("Рабочий поток",
+                            Thread.currentThread().getName()
+                                    + " выполняет задачу.");
 
                     try {
-                        log("Task started");
-                        // выполняем задачу
                         task.run();
-                        log("Task finished");
-                    } finally {
-                        // после выполнения снова становится idle
-                        idleThreads.incrementAndGet();
+                    } catch (Exception e) {
+                        PoolLogger.log("Ошибка",
+                                "Во время выполнения задачи возникло исключение: "
+                                        + e.getMessage());
                     }
                 }
-            } finally {
-                // при завершении потока уменьшаем счётчики
-                totalThreads.decrementAndGet();
-                workers.remove(this);
+
+            } catch (InterruptedException ignored) {
+                PoolLogger.log("Рабочий поток",
+                        Thread.currentThread().getName()
+                                + " был прерван.");
             }
         }
     }
